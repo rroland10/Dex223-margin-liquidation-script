@@ -3,11 +3,31 @@ from typing import Iterable, Optional
 from eth_utils import keccak, to_hex
 
 
+def _canonical_type(inp: dict) -> str:
+    """Canonical ABI type. Tuples must be expanded into their components, otherwise the computed
+    signature says "tuple" and the resulting topic0 never matches a real log."""
+    t = inp["type"]
+    if t.startswith("tuple"):
+        inner = ",".join(_canonical_type(c) for c in inp.get("components", []))
+        return f"({inner}){t[len('tuple'):]}"
+    return t
+
+
 def _build_topics(abi: list[dict], event_names: Iterable[str]) -> dict[str, str]:
     topics: dict[str, str] = {}
     for name in event_names:
-        ev = next(a for a in abi if a.get("name") == name and a["type"] == "event")
-        sig = f"{name}(" + ",".join(i["type"] for i in ev["inputs"]) + ")"
+        ev = next(
+            (a for a in abi if a.get("name") == name and a.get("type") == "event"),
+            None,
+        )
+        if ev is None:
+            # `next()` had no default, so a renamed or removed event surfaced as a bare
+            # StopIteration at startup with no indication of which one was missing.
+            raise ValueError(
+                f"Event '{name}' is not present in the ABI. The ABI and the configured event "
+                f"list have drifted apart; the bot cannot subscribe to it."
+            )
+        sig = f"{name}(" + ",".join(_canonical_type(i) for i in ev["inputs"]) + ")"
         topics[name] = to_hex(keccak(text=sig))
     return topics
 

@@ -44,10 +44,51 @@ class StartupInitializer:
             if dto.status is True and dto.liquidator is None:
                 await self.liquidator.freeze_now(pid)
 
+    async def _recover_frozen(self, pid: int) -> bool:
+        """Re-arm a position this bot already froze on chain.
+
+        LiquidatorService tracks frozen positions only in memory (`frozen_positions`), and nothing in
+        the schema records the freeze. On restart that state is gone, and because run() below only
+        initialises positions *missing* from the DB, an already-known frozen position was never looked
+        at again: the bot had paid gas to claim liquidator rights and then never liquidated it.
+        """
+        async with self.sem:
+            try:
+                dto = await self.mm.subject_to_liquidation(pid)
+            except Exception as e:
+                logger.warning(f"StartupInitializer: could not read position {pid}: {e}")
+                return False
+
+            if dto.liquidated or not dto.frozen_ts:
+                return False
+            if dto.liquidator is None:
+                return False
+            if dto.liquidator.lower() != self.liquidator.liquidate_address.lower():
+                return False  # somebody else holds the freeze
+
+            # block 0 so to_liquidate() releases it on the very next block; the contract's own
+            # "frozenTime < block.timestamp" check still enforces the one-block delay.
+            self.liquidator.frozen_positions[pid] = 0
+            logger.warning(f"StartupInitializer: recovered frozen position {pid} for liquidation")
+            return True
+
     async def run(self):
         total = await self.mm.position_index()
         existing = set(await PositionRepository(session_factory=self.sf).get_skip_position_ids())
         missing = [pid for pid in range(total) if pid not in existing]
+
+        # Positions already in the DB are not re-initialised, so recover any freeze we still hold.
+        known = [pid for pid in range(total) if pid in existing]
+        if known:
+            recovered = await asyncio.gather(
+                *(self._recover_frozen(pid) for pid in known), return_exceptions=True
+            )
+            n = sum(1 for r in recovered if r is True)
+            for r in recovered:
+                if isinstance(r, Exception):
+                    logger.exception("StartupInitializer recovery task failed: {}", r)
+            if n:
+                logger.warning(f"StartupInitializer: re-armed {n} frozen position(s) after restart")
 
         if not missing:
             logger.info("StartupInitializer: no missing items")
