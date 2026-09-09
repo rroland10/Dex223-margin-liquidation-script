@@ -18,6 +18,8 @@ from services.event_orchestrator import EventOrchestrator
 from services.liquidator import LiquidatorService
 from services.startup_initializer import StartupInitializer
 
+HANDLE_BLOCK_ATTEMPTS = 5
+
 ASSET_EVENTS = ["NewAsset", "AssetRemoved"]
 POOL_EVENTS = ["Initialize", "Swap", "Mint", "Burn", "Collect"]
 
@@ -61,14 +63,31 @@ async def main():
         while True:
             block = await queue.get()
             try:
-                # on-chain part with retracements
-                while True:
+                # on-chain part with retracements.
+                # NOTE: this retry used to be unbounded (`while True`). A deterministic failure - an
+                # undecodable log, a persistent DB error - wedged the worker on a single block forever
+                # while the poller kept filling the queue, so no position was ever liquidated again and
+                # memory grew without limit. Skipping a block is recoverable: PoolRepository.
+                # find_positions() also unions an "overdue" query on predict_check_timestamp, so
+                # positions are still picked up on a later block even if this one's events are lost.
+                ids = []
+                for attempt in range(1, HANDLE_BLOCK_ATTEMPTS + 1):
                     try:
                         ids = [pid async for pid in orchestrator.handle_block(block)]
                         break
                     except Exception as e:
-                        logger.exception(f"handle_block failed on {block['number']}: {e}")
-                        await asyncio.sleep(1.0)
+                        logger.exception(
+                            f"handle_block failed on {block['number']} "
+                            f"(attempt {attempt}/{HANDLE_BLOCK_ATTEMPTS}): {e}"
+                        )
+                        if attempt == HANDLE_BLOCK_ATTEMPTS:
+                            logger.error(
+                                f"Giving up on block {block['number']} after "
+                                f"{HANDLE_BLOCK_ATTEMPTS} attempts; continuing so the queue drains. "
+                                f"Positions remain reachable via the overdue check."
+                            )
+                        else:
+                            await asyncio.sleep(1.0)
 
                 # parallel: each call has its own session/connection
                 fr = await asyncio.gather(*(liquidator.frozen(pid, block) for pid in ids), return_exceptions=True)

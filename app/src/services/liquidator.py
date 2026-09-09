@@ -24,6 +24,8 @@ class SubjectToLiquidation:
 
 
 class LiquidatorService:
+    MAX_LIQUIDATE_ATTEMPTS = 3
+
     def __init__(
             self,
             w3: AsyncWeb3,
@@ -44,6 +46,7 @@ class LiquidatorService:
         # positionId -> tx_hash of freeze
         self._freeze_txs: dict[int, HexBytes] = {}
         self.frozen_positions: dict[int, int] = {}  # positionId -> block_number
+        self._liquidate_attempts: dict[int, int] = {}  # positionId -> failed attempts
 
     async def frozen(self, position_id: int, block: BlockData) -> None:
         # already processed / awaiting receipt
@@ -68,17 +71,22 @@ class LiquidatorService:
         self._freeze_txs[position_id] = tx_hash
         logger.info(f"Sent freeze tx {tx_hash.to_0x_hex()} for position {position_id}")
 
-        receipt = await self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)
+        # NOTE: the receipt wait must be guarded. If it raises (600s timeout, RPC error) the entry in
+        # _freeze_txs used to be left behind, and the guard at the top of this method then skipped the
+        # position forever - it was frozen on chain but never liquidated.
+        try:
+            receipt = await self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)
+        finally:
+            self._freeze_txs.pop(position_id, None)
+
         block_number = receipt['blockNumber']
         if receipt['status'] != 1:
             logger.error(f"Freeze tx {tx_hash.to_0x_hex()} failed for position {position_id}")
-            del self._freeze_txs[position_id]
             return
 
         logger.info(f"Freeze tx mined in block {block_number} for position {position_id}")
 
         # move from queue -> frozen
-        del self._freeze_txs[position_id]
         self.frozen_positions[position_id] = block_number
 
     async def freeze_now(self, position_id: int) -> None:
@@ -100,13 +108,15 @@ class LiquidatorService:
         self._freeze_txs[position_id] = tx_hash
         logger.info(f"[startup] Sent freeze tx {tx_hash.to_0x_hex()} for position {position_id}")
 
-        receipt = await self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)
+        try:
+            receipt = await self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)
+        finally:
+            self._freeze_txs.pop(position_id, None)
+
         if receipt['status'] != 1:
             logger.error(f"[startup] Freeze tx {tx_hash.to_0x_hex()} failed for position {position_id}")
-            del self._freeze_txs[position_id]
             return
 
-        del self._freeze_txs[position_id]
         self.frozen_positions[position_id] = receipt['blockNumber']
 
     def to_liquidate(self, block: BlockData) -> Iterable[int]:
@@ -121,19 +131,55 @@ class LiquidatorService:
             yield position_id
 
     async def liquidate(self, position_id, block: BlockData) -> None:
+        # NOTE: this used to `del self.frozen_positions[position_id]` first, so any failure below
+        # dropped the position permanently - already frozen on chain (gas paid, liquidator rights held)
+        # but never liquidated. It also called set_liquidated() straight after send_raw_transaction,
+        # recording a liquidation in the DB even when the transaction reverted or was dropped.
+        frozen_block = self.frozen_positions.get(position_id)
         try:
-            del self.frozen_positions[position_id]
             subject = await self.mm.subject_to_liquidation(position_id)
 
             # we check that we are the liquidator
-            if subject.status is True and subject.liquidator == self.liquidate_address and subject.liquidated is False:
-                tx_hash = await self._send_liquidate_tx(position_id)
-                logger.info(f"Sent liquidation tx {tx_hash.to_0x_hex()} for {position_id}")
-                await PositionRepository(session_factory=self.sf).set_liquidated(position_id)
-            else:
+            if not (subject.status is True
+                    and subject.liquidator == self.liquidate_address
+                    and subject.liquidated is False):
                 logger.info(f"Position {position_id} no longer liquidatable at block {block['number']}")
+                self.frozen_positions.pop(position_id, None)
+                self._liquidate_attempts.pop(position_id, None)
+                return
+
+            tx_hash = await self._send_liquidate_tx(position_id)
+            logger.info(f"Sent liquidation tx {tx_hash.to_0x_hex()} for {position_id}")
+
+            receipt = await self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=600)
+            if receipt['status'] != 1:
+                raise RuntimeError(
+                    f"liquidation tx {tx_hash.to_0x_hex()} reverted for position {position_id}"
+                )
+
+            # only now is the position genuinely liquidated
+            await PositionRepository(session_factory=self.sf).set_liquidated(position_id)
+            self.frozen_positions.pop(position_id, None)
+            self._liquidate_attempts.pop(position_id, None)
+            logger.info(f"Liquidated position {position_id} in block {receipt['blockNumber']}")
         except Exception as e:
-            logger.error(f"Error liquidating position {position_id}: {e}")
+            attempts = self._liquidate_attempts.get(position_id, 0) + 1
+            self._liquidate_attempts[position_id] = attempts
+            if attempts >= self.MAX_LIQUIDATE_ATTEMPTS:
+                logger.error(
+                    f"Giving up on position {position_id} after {attempts} attempts: {e}"
+                )
+                self.frozen_positions.pop(position_id, None)
+                self._liquidate_attempts.pop(position_id, None)
+            else:
+                # keep it queued so the next block retries, capped so a permanently reverting
+                # position cannot burn gas forever
+                if frozen_block is not None:
+                    self.frozen_positions[position_id] = frozen_block
+                logger.error(
+                    f"Error liquidating position {position_id} "
+                    f"(attempt {attempts}/{self.MAX_LIQUIDATE_ATTEMPTS}): {e}"
+                )
 
     async def _send_liquidate_tx(self, position_id: int) -> HexBytes:
         if self._chain_id is None:

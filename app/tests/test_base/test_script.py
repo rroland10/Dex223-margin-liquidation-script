@@ -14,7 +14,7 @@ from config import settings, ROOT_PATH
 RPC_URL = settings.HTTP_RPC_URL
 PRIVATE_KEY = settings.PRIVATE_KEY
 CONTRACT_ADDRESS = Web3.to_checksum_address("0x252D414f545903256B1E2C0BD00C18D2135F9a30")
-ABI_PATH = ROOT_PATH / "test" / "abi" / "UtilityModuleCfg.json"
+ABI_PATH = ROOT_PATH / "tests" / "abi" / "UtilityModuleCFG2.json"  # was ROOT_PATH/"test"/"abi"/"UtilityModuleCfg.json" - neither the dir nor the file exists
 
 fake = Faker()
 
