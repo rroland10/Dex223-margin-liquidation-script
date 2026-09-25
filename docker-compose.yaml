@@ -28,6 +28,7 @@ services:
       - ./volumes/app/logs:/app/logs
     depends_on:
       - db
+    restart: unless-stopped
 
 volumes:
   postgres-data:
