@@ -25,6 +25,7 @@ class SubjectToLiquidation:
 
 class LiquidatorService:
     MAX_LIQUIDATE_ATTEMPTS = 3
+    MAX_TX_GAS = 16_000_000
 
     def __init__(
             self,
@@ -201,14 +202,18 @@ class LiquidatorService:
         base_fee = hist["baseFeePerGas"][-1]
         max_fee = base_fee + priority_fee
 
-        tx = await self.mm.contract.functions.liquidate(
-            position_id, self.liquidate_address
-        ).build_transaction({
+        call = self.mm.contract.functions.liquidate(position_id, self.liquidate_address)
+        # A fixed 50M limit exceeds the per-transaction cap (EIP-7825, 2**24) and makes the node
+        # demand 50M * maxFeePerGas up front, so every freeze and liquidation was rejected.
+        estimate = await call.estimate_gas({"from": self.from_address})
+        gas = min(estimate * 13 // 10, self.MAX_TX_GAS)
+
+        tx = await call.build_transaction({
             "from": self.from_address,
             "nonce": nonce_to_use,
             "maxPriorityFeePerGas": priority_fee,
             "maxFeePerGas": max_fee,
-            "gas": 50_000_000,
+            "gas": gas,
             "chainId": self._chain_id,
         })
 
