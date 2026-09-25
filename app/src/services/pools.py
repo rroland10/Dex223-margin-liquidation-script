@@ -10,3 +10,7 @@ class PoolService:
     async def affected_positions(self, pool_address: str, ts: int) -> list[int]:
         repo = PoolRepository(session_factory=self.sf)
         return list(await repo.find_positions(pool_id=pool_address, cutoff_ts=ts))
+
+    async def overdue_positions(self, ts: int) -> list[int]:
+        repo = PoolRepository(session_factory=self.sf)
+        return list(await repo.find_overdue(cutoff_ts=ts))

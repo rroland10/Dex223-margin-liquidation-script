@@ -66,6 +66,13 @@ class EventOrchestrator:
                     emitted.add(pid)
                     yield pid
 
+        # 4) Interest alone can make a position liquidatable with no pool activity at all,
+        # so positions past their predicted insolvency time are checked on every block.
+        for pid in await self.pools.overdue_positions(block['timestamp']):
+            if pid not in emitted:
+                emitted.add(pid)
+                yield pid
+
     async def _get_logs(self, block: BlockData) -> list[dict]:
         if not self.topics.all_topics:
             return []
