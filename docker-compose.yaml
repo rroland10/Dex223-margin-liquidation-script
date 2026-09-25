@@ -8,8 +8,9 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    # Only the tracker needs the database. Publishing on 127.0.0.1 keeps it off the server's public interface.
     ports:
-      - '${POSTGRES_PORT}:${POSTGRES_PORT}'
+      - '127.0.0.1:${POSTGRES_PORT}:${POSTGRES_PORT}'
     restart: unless-stopped
     command: [ "postgres", "-c", "max_connections=400", "-c", "shared_buffers=256MB" ]
 
