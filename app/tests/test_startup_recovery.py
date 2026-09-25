@@ -36,6 +36,10 @@ class FakeLiquidator:
     def __init__(self):
         self.frozen_positions = {}
         self.liquidate_address = US
+        self.freeze_now_calls = []
+
+    async def freeze_now(self, pid):
+        self.freeze_now_calls.append(pid)
 
 
 def build(subjects):
@@ -94,3 +98,23 @@ async def test_an_rpc_failure_does_not_abort_startup():
     init = build({})
     init.mm = Boom()
     assert await init._recover_frozen(7) is False  # logged and skipped, not raised
+
+
+@pytest.mark.asyncio
+async def test_freezes_a_known_position_that_went_underwater_unclaimed():
+    subjects = {7: SubjectToLiquidation(True, None, None, None, False)}
+    init = build(subjects)
+    assert await init._freeze_if_eligible(7) is True
+    assert init.liquidator.freeze_now_calls == [7]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subject", [
+    SubjectToLiquidation(False, None, None, 99, False),   # healthy
+    SubjectToLiquidation(True, THEM, 1234, None, False),  # someone else froze it
+    SubjectToLiquidation(True, None, None, None, True),   # already liquidated
+])
+async def test_does_not_freeze_a_position_that_is_not_ours_to_take(subject):
+    init = build({7: subject})
+    assert await init._freeze_if_eligible(7) is False
+    assert init.liquidator.freeze_now_calls == []

@@ -72,6 +72,24 @@ class StartupInitializer:
             logger.warning(f"StartupInitializer: recovered frozen position {pid} for liquidation")
             return True
 
+    async def _freeze_if_eligible(self, pid: int) -> bool:
+        """Freeze a known position that is liquidatable and unclaimed.
+
+        Known positions are skipped by the initialisation below, and the per-block checks only reach
+        a position through pool events or its predicted insolvency time. A position that went
+        underwater while the bot was down has neither, so without this it was never frozen.
+        """
+        async with self.sem:
+            try:
+                dto = await self.mm.subject_to_liquidation(pid)
+            except Exception as e:
+                logger.warning(f"StartupInitializer: could not read position {pid}: {e}")
+                return False
+        if dto.liquidated or dto.status is not True or dto.liquidator is not None:
+            return False
+        await self.liquidator.freeze_now(pid)
+        return True
+
     async def run(self):
         total = await self.mm.position_index()
         existing = set(await PositionRepository(session_factory=self.sf).get_skip_position_ids())
@@ -89,6 +107,14 @@ class StartupInitializer:
                     logger.exception("StartupInitializer recovery task failed: {}", r)
             if n:
                 logger.warning(f"StartupInitializer: re-armed {n} frozen position(s) after restart")
+
+            unclaimed = [pid for pid, r in zip(known, recovered) if r is not True]
+            frozen = await asyncio.gather(
+                *(self._freeze_if_eligible(pid) for pid in unclaimed), return_exceptions=True
+            )
+            for r in frozen:
+                if isinstance(r, Exception):
+                    logger.exception("StartupInitializer freeze task failed: {}", r)
 
         if not missing:
             logger.info("StartupInitializer: no missing items")

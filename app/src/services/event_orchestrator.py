@@ -58,8 +58,13 @@ class EventOrchestrator:
             await self.positions.ensure_exists(pid)
             await self.positions.sync_pools(pid)
 
+        # A new or changed position is checked right away, which also refreshes its stored
+        # predicted insolvency time.
+        emitted: Set[int] = set(positions_from_assets)
+        for pid in positions_from_assets:
+            yield pid
+
         # 3) For all pools - find affected positions (unique!)
-        emitted: Set[int] = set()
         for pool_addr in pools_touched:
             for pid in await self.pools.affected_positions(pool_addr, block['timestamp']):
                 if pid not in emitted:
